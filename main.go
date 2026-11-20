@@ -171,23 +171,63 @@ func handlePair(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[pair %s] Connect failed: %v", id, err)
 		_ = container.Close()
 		cleanupFile()
+		jobsMu.Lock()
+		delete(jobs, id)
+		jobsMu.Unlock()
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Could not connect to WhatsApp, try again."})
 		return
 	}
 
-	time.Sleep(8 * time.Second) // let the websocket handshake finish
-
-	code, err := wac.PairPhone(context.Background(), number, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
-	if err != nil {
-		time.Sleep(3 * time.Second)
-		code, err = wac.PairPhone(context.Background(), number, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+	// PairPhone needs an active websocket. A fixed sleep doesn't guarantee
+	// that the connection is still alive, especially on hosted dynos.
+	var code string
+	var pairErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if !wac.IsConnected() {
+			log.Printf("[pair %s] websocket disconnected before attempt %d; reconnecting", id, attempt)
+			if err := wac.Connect(); err != nil {
+				pairErr = fmt.Errorf("reconnect: %w", err)
+				log.Printf("[pair %s] %v", id, pairErr)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+		}
+		// Allow the connection to settle, but abort early if it drops.
+		ready := false
+		for wait := 0; wait < 20; wait++ {
+			if wac.IsConnected() {
+				ready = true
+				break
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		if !ready {
+			pairErr = fmt.Errorf("websocket did not become connected")
+			continue
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		code, pairErr = wac.PairPhone(ctx, number, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+		cancel()
+		if pairErr == nil {
+			break
+		}
+		log.Printf("[pair %s] PairPhone attempt %d failed (connected=%t): %v", id, attempt, wac.IsConnected(), pairErr)
+		if wac.IsConnected() {
+			// Non-network errors (invalid number, rate limits, etc.) shouldn't
+			// trigger repeated pairing requests.
+			break
+		}
+		time.Sleep(2 * time.Second)
 	}
-	if err != nil {
-		log.Printf("[pair %s] PairPhone failed: %v", id, err)
+	if pairErr != nil {
+		log.Printf("[pair %s] PairPhone failed: %v", id, pairErr)
 		wac.Disconnect()
 		_ = container.Close()
 		cleanupFile()
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Could not get a pair code — check the number and try again."})
+		jobsMu.Lock()
+		delete(jobs, id)
+		jobsMu.Unlock()
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "WhatsApp connection or pairing failed. Please retry shortly."})
 		return
 	}
 
