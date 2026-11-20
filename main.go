@@ -30,11 +30,9 @@ import (
 //go:embed index.html
 var indexHTML []byte
 
-// ── in-memory-only job tracking (never touches disk) ───────────────────
-
 type job struct {
 	mu         sync.Mutex
-	status     string // "waiting" -> "code" -> "done" | "error"
+	status     string
 	code       string
 	sessionOut string
 	errMsg     string
@@ -124,7 +122,7 @@ func handlePair(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]string{"id": id, "code": j.code})
 		}
 		j.mu.Unlock()
-	case <-time.After(25 * time.Second): 
+	case <-time.After(25 * time.Second):
 		writeJSON(w, http.StatusOK, map[string]string{"id": id, "status": "waiting"})
 	}
 }
@@ -207,18 +205,18 @@ func runPairingJob(id string, number string, j *job) {
 		return
 	}
 
-	// Eh line sab ton important hai: Connection establish hone tak wait karo
+	// Timeout 60 second kita gaya hai taaki network slow hove ta vi connect ho sake
 	select {
 	case <-connectedCh:
 		log.Printf("[pair %s] connection ready for pairing", id)
-	case <-time.After(30 * time.Second):
+	case <-time.After(60 * time.Second):
 		log.Printf("[pair %s] timeout waiting for connection", id)
 		wac.Disconnect()
 		_ = container.Close()
 		cleanupFile()
 		j.mu.Lock()
 		j.status = "error"
-		j.errMsg = "Timeout waiting for WhatsApp connection."
+		j.errMsg = "Timeout waiting for WhatsApp connection. (Check internet or try again)."
 		j.mu.Unlock()
 		return
 	}
