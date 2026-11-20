@@ -140,7 +140,13 @@ func handlePair(w http.ResponseWriter, r *http.Request) {
 	wac := whatsmeow.NewClient(device, waLog.Noop)
 
 	wac.AddEventHandler(func(evt interface{}) {
-		if _, ok := evt.(*events.Connected); !ok {
+		switch evt.(type) {
+		case *events.Disconnected:
+			log.Printf("[pair %s] WhatsApp websocket disconnected", id)
+			return
+		case *events.Connected:
+			log.Printf("[pair %s] WhatsApp connected event received", id)
+		default:
 			return
 		}
 		j.mu.Lock()
@@ -167,6 +173,7 @@ func handlePair(w http.ResponseWriter, r *http.Request) {
 		}()
 	})
 
+	log.Printf("[pair %s] connecting to WhatsApp", id)
 	if err := wac.Connect(); err != nil {
 		log.Printf("[pair %s] Connect failed: %v", id, err)
 		_ = container.Close()
@@ -205,6 +212,7 @@ func handlePair(w http.ResponseWriter, r *http.Request) {
 			pairErr = fmt.Errorf("websocket did not become connected")
 			continue
 		}
+		log.Printf("[pair %s] requesting pair code (attempt %d)", id, attempt)
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		code, pairErr = wac.PairPhone(ctx, number, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 		cancel()
@@ -227,7 +235,7 @@ func handlePair(w http.ResponseWriter, r *http.Request) {
 		jobsMu.Lock()
 		delete(jobs, id)
 		jobsMu.Unlock()
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "WhatsApp connection or pairing failed. Please retry shortly."})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "WhatsApp connection dropped during pairing. Check Heroku logs for the disconnect reason."})
 		return
 	}
 

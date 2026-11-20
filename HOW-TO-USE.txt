@@ -1,1 +1,0 @@
-Session generator files only. Copy these files into the root of your existing WtWeb project. Keep your existing go.mod, go.sum, and whatsmeow/ folder from the updated project. This ZIP is NOT standalone: it requires the existing Go module and WhatsMeow dependency.
