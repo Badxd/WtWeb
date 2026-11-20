@@ -1,9 +1,6 @@
 // session-web is a standalone, disposable website: it pairs a WhatsApp
 // number via whatsmeow, shows the resulting SHORT session string once in
 // the browser, and never writes it to disk, a database, or a log line.
-// Nothing here talks to Mongo, nothing here writes files — it's meant to
-// be deployed on its own (its own Heroku app / its own dyno) purely as a
-// "get my session string" tool.
 package main
 
 import (
@@ -42,6 +39,7 @@ type job struct {
 	sessionOut string
 	errMsg     string
 	createdAt  time.Time
+	doneCh     chan struct{}
 }
 
 var (
@@ -55,7 +53,6 @@ func newJobID() string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
-// janitor drops jobs nobody ever polled, so memory doesn't grow forever.
 func janitor() {
 	for {
 		time.Sleep(2 * time.Minute)
@@ -107,15 +104,37 @@ func handlePair(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := newJobID()
-	j := &job{status: "waiting", createdAt: time.Now()}
+	j := &job{
+		status:    "waiting",
+		createdAt: time.Now(),
+		doneCh:    make(chan struct{}),
+	}
 	jobsMu.Lock()
 	jobs[id] = j
 	jobsMu.Unlock()
 
-	// A real (but temporary) SQLite file. Heroku's filesystem is ephemeral
-	// anyway, and we delete this file ourselves within seconds of pairing —
-	// it never gets backed up or persisted, it's just more reliable than
-	// SQLite's shared in-memory URI mode across driver versions.
+	// Start pairing in a background goroutine so we don't block the HTTP response
+	go runPairingJob(id, number, j)
+
+	// Wait a maximum of 20 seconds for the pairing code.
+	// If it takes longer, we return "waiting" and the frontend will poll /status.
+	select {
+	case <-j.doneCh:
+		j.mu.Lock()
+		if j.status == "error" {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": j.errMsg})
+		} else {
+			writeJSON(w, http.StatusOK, map[string]string{"id": id, "code": j.code})
+		}
+		j.mu.Unlock()
+	case <-time.After(20 * time.Second):
+		writeJSON(w, http.StatusOK, map[string]string{"id": id, "status": "waiting"})
+	}
+}
+
+func runPairingJob(id string, number string, j *job) {
+	defer close(j.doneCh)
+
 	dbPath := filepath.Join(os.TempDir(), "session-web-"+id+".db")
 	cleanupFile := func() {
 		_ = os.Remove(dbPath)
@@ -132,45 +151,57 @@ func handlePair(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Printf("[pair %s] sqlstore.New failed: %v", id, err)
 		cleanupFile()
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error (store): " + err.Error()})
+		j.mu.Lock()
+		j.status = "error"
+		j.errMsg = "internal error (store): " + err.Error()
+		j.mu.Unlock()
 		return
 	}
 
 	device := container.NewDevice()
 	wac := whatsmeow.NewClient(device, waLog.Noop)
 
+	// Channel to wait for connection
+	connectedCh := make(chan struct{})
+	var connectedOnce sync.Once
+
 	wac.AddEventHandler(func(evt interface{}) {
 		switch evt.(type) {
 		case *events.Disconnected:
 			log.Printf("[pair %s] WhatsApp websocket disconnected", id)
-			return
 		case *events.Connected:
 			log.Printf("[pair %s] WhatsApp connected event received", id)
-		default:
-			return
+			connectedOnce.Do(func() { close(connectedCh) })
+		case *events.PairSuccess:
+			log.Printf("[pair %s] Pair Success!", id)
+		case *events.PairError:
+			log.Printf("[pair %s] Pair Error!", id)
 		}
+
 		j.mu.Lock()
 		defer j.mu.Unlock()
-		if j.status == "done" {
+		if j.status == "done" || j.status == "error" {
 			return
 		}
-		sess, err := encodeShort(wac.Store)
-		if err != nil {
-			j.status = "error"
-			j.errMsg = "Paired, but could not read back the device identity: " + err.Error()
-			return
-		}
-		j.status = "done"
-		j.sessionOut = sess
 
-		// Nothing is persisted: disconnect and delete the temp file
-		// shortly after so no state lingers on disk either.
-		go func() {
-			time.Sleep(3 * time.Second)
-			wac.Disconnect()
-			_ = container.Close()
-			cleanupFile()
-		}()
+		// If we are connected and have a session
+		if wac.Store.ID != nil {
+			sess, err := encodeShort(wac.Store)
+			if err != nil {
+				j.status = "error"
+				j.errMsg = "Paired, but could not read back the device identity: " + err.Error()
+				return
+			}
+			j.status = "done"
+			j.sessionOut = sess
+
+			go func() {
+				time.Sleep(3 * time.Second)
+				wac.Disconnect()
+				_ = container.Close()
+				cleanupFile()
+			}()
+		}
 	})
 
 	log.Printf("[pair %s] connecting to WhatsApp", id)
@@ -181,61 +212,46 @@ func handlePair(w http.ResponseWriter, r *http.Request) {
 		jobsMu.Lock()
 		delete(jobs, id)
 		jobsMu.Unlock()
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Could not connect to WhatsApp, try again."})
+		j.mu.Lock()
+		j.status = "error"
+		j.errMsg = "Could not connect to WhatsApp, try again."
+		j.mu.Unlock()
 		return
 	}
 
-	// PairPhone needs an active websocket. A fixed sleep doesn't guarantee
-	// that the connection is still alive, especially on hosted dynos.
-	var code string
-	var pairErr error
-	for attempt := 1; attempt <= 3; attempt++ {
-		if !wac.IsConnected() {
-			log.Printf("[pair %s] websocket disconnected before attempt %d; reconnecting", id, attempt)
-			if err := wac.Connect(); err != nil {
-				pairErr = fmt.Errorf("reconnect: %w", err)
-				log.Printf("[pair %s] %v", id, pairErr)
-				time.Sleep(2 * time.Second)
-				continue
-			}
-		}
-		// Allow the connection to settle, but abort early if it drops.
-		ready := false
-		for wait := 0; wait < 20; wait++ {
-			if wac.IsConnected() {
-				ready = true
-				break
-			}
-			time.Sleep(250 * time.Millisecond)
-		}
-		if !ready {
-			pairErr = fmt.Errorf("websocket did not become connected")
-			continue
-		}
-		log.Printf("[pair %s] requesting pair code (attempt %d)", id, attempt)
-		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-		code, pairErr = wac.PairPhone(ctx, number, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
-		cancel()
-		if pairErr == nil {
-			break
-		}
-		log.Printf("[pair %s] PairPhone attempt %d failed (connected=%t): %v", id, attempt, wac.IsConnected(), pairErr)
-		if wac.IsConnected() {
-			// Non-network errors (invalid number, rate limits, etc.) shouldn't
-			// trigger repeated pairing requests.
-			break
-		}
-		time.Sleep(2 * time.Second)
+	// Wait for the connection event (max 15 seconds)
+	select {
+	case <-connectedCh:
+		log.Printf("[pair %s] connection ready for pairing", id)
+	case <-time.After(15 * time.Second):
+		log.Printf("[pair %s] timeout waiting for connection", id)
+		wac.Disconnect()
+		_ = container.Close()
+		cleanupFile()
+		j.mu.Lock()
+		j.status = "error"
+		j.errMsg = "Timeout waiting for WhatsApp connection."
+		j.mu.Unlock()
+		return
 	}
+
+	// PairPhone needs a background context, NOT r.Context().
+	// If we use r.Context() and the browser disconnects, the pairing dies.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	log.Printf("[pair %s] requesting pair code", id)
+	code, pairErr := wac.PairPhone(ctx, number, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+
 	if pairErr != nil {
 		log.Printf("[pair %s] PairPhone failed: %v", id, pairErr)
 		wac.Disconnect()
 		_ = container.Close()
 		cleanupFile()
-		jobsMu.Lock()
-		delete(jobs, id)
-		jobsMu.Unlock()
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "WhatsApp connection dropped during pairing. Check Heroku logs for the disconnect reason."})
+		j.mu.Lock()
+		j.status = "error"
+		j.errMsg = "WhatsApp connection dropped during pairing: " + pairErr.Error()
+		j.mu.Unlock()
 		return
 	}
 
@@ -243,8 +259,6 @@ func handlePair(w http.ResponseWriter, r *http.Request) {
 	j.status = "code"
 	j.code = code
 	j.mu.Unlock()
-
-	writeJSON(w, http.StatusOK, map[string]string{"id": id, "code": code})
 }
 
 func handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -260,12 +274,15 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	j.mu.Lock()
 	status := j.status
+	code := j.code
 	sess := j.sessionOut
 	errMsg := j.errMsg
 	j.mu.Unlock()
 
 	resp := map[string]string{"status": status}
-	if status == "done" {
+	if status == "code" {
+		resp["code"] = code
+	} else if status == "done" {
 		resp["session"] = sess
 	} else if status == "error" {
 		resp["error"] = errMsg
@@ -273,8 +290,7 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 
 	// One-time reveal: once the browser has picked up the final state,
-	// forget it server-side so the session string can't be re-fetched
-	// from this process again.
+	// forget it server-side so the session string can't be re-fetched.
 	if status == "done" || status == "error" {
 		jobsMu.Lock()
 		delete(jobs, id)
@@ -283,9 +299,6 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── short session encoding (same format as PbxGb/session.Encode) ──────
-//
-// Duplicated here on purpose: this tool is meant to be deployed
-// completely standalone from the bot repo, with no shared module.
 
 func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
 
