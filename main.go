@@ -113,11 +113,8 @@ func handlePair(w http.ResponseWriter, r *http.Request) {
 	jobs[id] = j
 	jobsMu.Unlock()
 
-	// Start pairing in a background goroutine so we don't block the HTTP response
 	go runPairingJob(id, number, j)
 
-	// Wait a maximum of 20 seconds for the pairing code.
-	// If it takes longer, we return "waiting" and the frontend will poll /status.
 	select {
 	case <-j.doneCh:
 		j.mu.Lock()
@@ -127,7 +124,7 @@ func handlePair(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]string{"id": id, "code": j.code})
 		}
 		j.mu.Unlock()
-	case <-time.After(20 * time.Second):
+	case <-time.After(25 * time.Second): 
 		writeJSON(w, http.StatusOK, map[string]string{"id": id, "status": "waiting"})
 	}
 }
@@ -161,7 +158,6 @@ func runPairingJob(id string, number string, j *job) {
 	device := container.NewDevice()
 	wac := whatsmeow.NewClient(device, waLog.Noop)
 
-	// Channel to wait for connection
 	connectedCh := make(chan struct{})
 	var connectedOnce sync.Once
 
@@ -172,10 +168,6 @@ func runPairingJob(id string, number string, j *job) {
 		case *events.Connected:
 			log.Printf("[pair %s] WhatsApp connected event received", id)
 			connectedOnce.Do(func() { close(connectedCh) })
-		case *events.PairSuccess:
-			log.Printf("[pair %s] Pair Success!", id)
-		case *events.PairError:
-			log.Printf("[pair %s] Pair Error!", id)
 		}
 
 		j.mu.Lock()
@@ -184,7 +176,6 @@ func runPairingJob(id string, number string, j *job) {
 			return
 		}
 
-		// If we are connected and have a session
 		if wac.Store.ID != nil {
 			sess, err := encodeShort(wac.Store)
 			if err != nil {
@@ -209,9 +200,6 @@ func runPairingJob(id string, number string, j *job) {
 		log.Printf("[pair %s] Connect failed: %v", id, err)
 		_ = container.Close()
 		cleanupFile()
-		jobsMu.Lock()
-		delete(jobs, id)
-		jobsMu.Unlock()
 		j.mu.Lock()
 		j.status = "error"
 		j.errMsg = "Could not connect to WhatsApp, try again."
@@ -219,11 +207,11 @@ func runPairingJob(id string, number string, j *job) {
 		return
 	}
 
-	// Wait for the connection event (max 15 seconds)
+	// Eh line sab ton important hai: Connection establish hone tak wait karo
 	select {
 	case <-connectedCh:
 		log.Printf("[pair %s] connection ready for pairing", id)
-	case <-time.After(15 * time.Second):
+	case <-time.After(30 * time.Second):
 		log.Printf("[pair %s] timeout waiting for connection", id)
 		wac.Disconnect()
 		_ = container.Close()
@@ -235,8 +223,6 @@ func runPairingJob(id string, number string, j *job) {
 		return
 	}
 
-	// PairPhone needs a background context, NOT r.Context().
-	// If we use r.Context() and the browser disconnects, the pairing dies.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -289,16 +275,12 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, resp)
 
-	// One-time reveal: once the browser has picked up the final state,
-	// forget it server-side so the session string can't be re-fetched.
 	if status == "done" || status == "error" {
 		jobsMu.Lock()
 		delete(jobs, id)
 		jobsMu.Unlock()
 	}
 }
-
-// ── short session encoding (same format as PbxGb/session.Encode) ──────
 
 func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
 
