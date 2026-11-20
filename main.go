@@ -1,17 +1,16 @@
-// session-web is a standalone, disposable website: it pairs a WhatsApp
-// number via whatsmeow, shows the resulting SHORT session string once in
-// the browser, and never writes it to disk, a database, or a log line.
+// session-cli is a standalone, disposable CLI tool: it pairs a WhatsApp
+// number via whatsmeow, prints the pairing code to the terminal, and
+// outputs the resulting SHORT session string once paired.
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
-	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,258 +26,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-//go:embed index.html
-var indexHTML []byte
-
-type job struct {
-	mu         sync.Mutex
-	status     string
-	code       string
-	sessionOut string
-	errMsg     string
-	createdAt  time.Time
-	doneCh     chan struct{}
-}
-
-var (
-	jobsMu sync.Mutex
-	jobs   = map[string]*job{}
-)
-
-func newJobID() string {
-	b := make([]byte, 12)
-	_, _ = rand.Read(b)
-	return base64.RawURLEncoding.EncodeToString(b)
-}
-
-func janitor() {
-	for {
-		time.Sleep(2 * time.Minute)
-		cutoff := time.Now().Add(-10 * time.Minute)
-		jobsMu.Lock()
-		for id, j := range jobs {
-			j.mu.Lock()
-			old := j.createdAt.Before(cutoff)
-			j.mu.Unlock()
-			if old {
-				delete(jobs, id)
-			}
-		}
-		jobsMu.Unlock()
-	}
-}
-
-func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8000"
-	}
-
-	go janitor()
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write(indexHTML)
-	})
-	http.HandleFunc("/pair", handlePair)
-	http.HandleFunc("/status", handleStatus)
-
-	log.Printf("session-web listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
-}
-
-func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-func handlePair(w http.ResponseWriter, r *http.Request) {
-	number := strings.TrimSpace(r.URL.Query().Get("number"))
-	number = strings.NewReplacer("+", "", " ", "", "-", "").Replace(number)
-	if number == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Enter a WhatsApp number."})
-		return
-	}
-
-	id := newJobID()
-	j := &job{
-		status:    "waiting",
-		createdAt: time.Now(),
-		doneCh:    make(chan struct{}),
-	}
-	jobsMu.Lock()
-	jobs[id] = j
-	jobsMu.Unlock()
-
-	go runPairingJob(id, number, j)
-
-	select {
-	case <-j.doneCh:
-		j.mu.Lock()
-		if j.status == "error" {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": j.errMsg})
-		} else {
-			writeJSON(w, http.StatusOK, map[string]string{"id": id, "code": j.code})
-		}
-		j.mu.Unlock()
-	case <-time.After(25 * time.Second):
-		writeJSON(w, http.StatusOK, map[string]string{"id": id, "status": "waiting"})
-	}
-}
-
-func runPairingJob(id string, number string, j *job) {
-	defer close(j.doneCh)
-
-	dbPath := filepath.Join(os.TempDir(), "session-web-"+id+".db")
-	cleanupFile := func() {
-		_ = os.Remove(dbPath)
-		_ = os.Remove(dbPath + "-shm")
-		_ = os.Remove(dbPath + "-wal")
-	}
-
-	container, err := sqlstore.New(
-		context.Background(),
-		"sqlite3",
-		"file:"+dbPath+"?_foreign_keys=on",
-		nil,
-	)
-	if err != nil {
-		log.Printf("[pair %s] sqlstore.New failed: %v", id, err)
-		cleanupFile()
-		j.mu.Lock()
-		j.status = "error"
-		j.errMsg = "internal error (store): " + err.Error()
-		j.mu.Unlock()
-		return
-	}
-
-	device := container.NewDevice()
-	wac := whatsmeow.NewClient(device, waLog.Noop)
-
-	connectedCh := make(chan struct{})
-	var connectedOnce sync.Once
-
-	wac.AddEventHandler(func(evt interface{}) {
-		switch evt.(type) {
-		case *events.Disconnected:
-			log.Printf("[pair %s] WhatsApp websocket disconnected", id)
-		case *events.Connected:
-			log.Printf("[pair %s] WhatsApp connected event received", id)
-			connectedOnce.Do(func() { close(connectedCh) })
-		}
-
-		j.mu.Lock()
-		defer j.mu.Unlock()
-		if j.status == "done" || j.status == "error" {
-			return
-		}
-
-		if wac.Store.ID != nil {
-			sess, err := encodeShort(wac.Store)
-			if err != nil {
-				j.status = "error"
-				j.errMsg = "Paired, but could not read back the device identity: " + err.Error()
-				return
-			}
-			j.status = "done"
-			j.sessionOut = sess
-
-			go func() {
-				time.Sleep(3 * time.Second)
-				wac.Disconnect()
-				_ = container.Close()
-				cleanupFile()
-			}()
-		}
-	})
-
-	log.Printf("[pair %s] connecting to WhatsApp", id)
-	if err := wac.Connect(); err != nil {
-		log.Printf("[pair %s] Connect failed: %v", id, err)
-		_ = container.Close()
-		cleanupFile()
-		j.mu.Lock()
-		j.status = "error"
-		j.errMsg = "Could not connect to WhatsApp, try again."
-		j.mu.Unlock()
-		return
-	}
-
-	// Timeout 60 second kita gaya hai taaki network slow hove ta vi connect ho sake
-	select {
-	case <-connectedCh:
-		log.Printf("[pair %s] connection ready for pairing", id)
-	case <-time.After(60 * time.Second):
-		log.Printf("[pair %s] timeout waiting for connection", id)
-		wac.Disconnect()
-		_ = container.Close()
-		cleanupFile()
-		j.mu.Lock()
-		j.status = "error"
-		j.errMsg = "Timeout waiting for WhatsApp connection. (Check internet or try again)."
-		j.mu.Unlock()
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	log.Printf("[pair %s] requesting pair code", id)
-	code, pairErr := wac.PairPhone(ctx, number, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
-
-	if pairErr != nil {
-		log.Printf("[pair %s] PairPhone failed: %v", id, pairErr)
-		wac.Disconnect()
-		_ = container.Close()
-		cleanupFile()
-		j.mu.Lock()
-		j.status = "error"
-		j.errMsg = "WhatsApp connection dropped during pairing: " + pairErr.Error()
-		j.mu.Unlock()
-		return
-	}
-
-	j.mu.Lock()
-	j.status = "code"
-	j.code = code
-	j.mu.Unlock()
-}
-
-func handleStatus(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-
-	jobsMu.Lock()
-	j, ok := jobs[id]
-	jobsMu.Unlock()
-	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
-		return
-	}
-
-	j.mu.Lock()
-	status := j.status
-	code := j.code
-	sess := j.sessionOut
-	errMsg := j.errMsg
-	j.mu.Unlock()
-
-	resp := map[string]string{"status": status}
-	if status == "code" {
-		resp["code"] = code
-	} else if status == "done" {
-		resp["session"] = sess
-	} else if status == "error" {
-		resp["error"] = errMsg
-	}
-	writeJSON(w, http.StatusOK, resp)
-
-	if status == "done" || status == "error" {
-		jobsMu.Lock()
-		delete(jobs, id)
-		jobsMu.Unlock()
-	}
-}
+// ── short session encoding (same format as PbxGb/session.Encode) ──────
 
 func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
 
@@ -345,4 +93,124 @@ func encodeShort(device *store.Device) (string, error) {
 		return "", err
 	}
 	return base64.StdEncoding.EncodeToString(raw), nil
+}
+
+// ── Main Logic ─────────────────────────────────────────────────────────
+
+func main() {
+	// 1. Ask for Number
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Print("📱 Enter WhatsApp Number (e.g. 919465031516): ")
+	numberRaw, _ := reader.ReadString('\n')
+	number := strings.NewReplacer("+", "", " ", "", "-", "", "\n", "", "\r", "").Replace(numberRaw)
+
+	if number == "" {
+		log.Fatal("❌ Number cannot be empty.")
+	}
+
+	// 2. Setup temporary SQLite DB
+	dbPath := filepath.Join(os.TempDir(), "session-cli-temp.db")
+	defer func() {
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-shm")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	container, err := sqlstore.New(
+		context.Background(),
+		"sqlite3",
+		"file:"+dbPath+"?_foreign_keys=on",
+		nil,
+	)
+	if err != nil {
+		log.Fatalf("❌ DB Error: %v", err)
+	}
+
+	device := container.NewDevice()
+	wac := whatsmeow.NewClient(device, waLog.Noop)
+
+	// 3. Channels to track state
+	connectedCh := make(chan struct{})
+	sessionCh := make(chan string)
+	var connectedOnce sync.Once
+	var pairSuccess bool
+
+	wac.AddEventHandler(func(evt interface{}) {
+		switch evt.(type) {
+		case *events.Disconnected:
+			log.Println("⚠️ WhatsApp websocket disconnected")
+
+		case *events.Connected:
+			log.Println("✅ Connected to WhatsApp")
+			connectedOnce.Do(func() { close(connectedCh) })
+
+		case *events.PairSuccess:
+			pairSuccess = true
+			log.Println("✅ Pair Success! Logging in...")
+
+		case *events.PairError:
+			log.Println("❌ Pair Error. Code may be invalid or expired.")
+
+		default:
+			// If we are paired and have an ID, we can extract the session
+			if pairSuccess && wac.Store.ID != nil {
+				sess, err := encodeShort(wac.Store)
+				if err == nil && sess != "" {
+					select {
+					case sessionCh <- sess:
+						// Sent to main thread
+					default:
+						// Avoid blocking
+					}
+				}
+			}
+		}
+	})
+
+	// 4. Connect
+	log.Println("🔌 Connecting to WhatsApp...")
+	if err := wac.Connect(); err != nil {
+		log.Fatalf("❌ Could not connect: %v", err)
+	}
+
+	// Wait for connection (max 30s)
+	select {
+	case <-connectedCh:
+		// Ready
+	case <-time.After(30 * time.Second):
+		log.Fatal("❌ Timeout waiting for connection.")
+	}
+
+	// 5. Request Pair Code
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	log.Printf("🔑 Requesting Pair Code for %s...", number)
+	code, err := wac.PairPhone(ctx, number, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+	if err != nil {
+		log.Fatalf("❌ PairPhone failed: %v", err)
+	}
+
+	fmt.Println("\n==============================================")
+	fmt.Printf("🔑 YOUR PAIR CODE: %s\n", code)
+	fmt.Println("==============================================")
+	fmt.Println("👉 1. Open WhatsApp on your phone.")
+	fmt.Println("👉 2. Go to Linked Devices -> Link with phone number.")
+	fmt.Println("👉 3. Enter the code above.")
+	fmt.Println("⏳ Waiting for you to enter the code (max 2 minutes)...\n")
+
+	// 6. Wait for Session
+	select {
+	case session := <-sessionCh:
+		fmt.Println("\n==============================================")
+		fmt.Println("✅ SUCCESS! HERE IS YOUR SESSION STRING:")
+		fmt.Println("==============================================")
+		fmt.Println(session)
+		fmt.Println("==============================================")
+	case <-time.After(120 * time.Second):
+		log.Fatal("❌ Timeout: You did not enter the code on your phone in time.")
+	}
+
+	// Cleanup
+	wac.Disconnect()
 }
