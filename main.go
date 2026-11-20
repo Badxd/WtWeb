@@ -30,11 +30,9 @@ import (
 // ── Force IPv4 to fix Termux VPN IPv6 hangs ───────────────────────────
 
 func init() {
-	// Force websocket to use IPv4 only
 	websocket.DefaultDialer.NetDial = func(network, addr string) (net.Conn, error) {
 		return net.DialTimeout("tcp4", addr, 10*time.Second)
 	}
-	// Force Go's DNS resolver to use IPv4 only
 	net.DefaultResolver.PreferGo = true
 	net.DefaultResolver.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
 		d := net.Dialer{Timeout: 10 * time.Second}
@@ -141,32 +139,19 @@ func main() {
 	}
 
 	device := container.NewDevice()
-	// Logger ON kitta hai taaki error dikhe
-	wac := whatsmeow.NewClient(device, waLog.Stdout("WhatsApp", "DEBUG", true))
+	wac := whatsmeow.NewClient(device, waLog.Noop)
 
-	connectedCh := make(chan struct{})
 	sessionCh := make(chan string)
-	var connectedOnce sync.Once
 	var pairSuccess bool
 
 	wac.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
-		case *events.Disconnected:
-			log.Printf("⚠️ WhatsApp websocket disconnected: %v", v)
-
-		case *events.Connected:
-			log.Println("✅ Connected to WhatsApp")
-			connectedOnce.Do(func() { close(connectedCh) })
-
 		case *events.PairSuccess:
 			pairSuccess = true
 			log.Println("✅ Pair Success! Logging in...")
-
-		case *events.PairError:
-			log.Printf("❌ Pair Error: %v", v)
-
-		default:
-			if pairSuccess && wac.Store.ID != nil {
+			// Give it 2 seconds to sync keys before extracting session
+			time.Sleep(2 * time.Second)
+			if wac.Store.ID != nil {
 				sess, err := encodeShort(wac.Store)
 				if err == nil && sess != "" {
 					select {
@@ -175,6 +160,9 @@ func main() {
 					}
 				}
 			}
+
+		case *events.PairError:
+			log.Printf("❌ Pair Error: %v", v)
 		}
 	})
 
@@ -183,11 +171,17 @@ func main() {
 		log.Fatalf("❌ Could not connect: %v", err)
 	}
 
-	select {
-	case <-connectedCh:
-		// Ready
-	case <-time.After(60 * time.Second):
-		log.Fatal("❌ Timeout waiting for connection. Network block ya WhatsApp block ho sakda hai.")
+	// Wait for actual connection state instead of events
+	connected := false
+	for i := 0; i < 30; i++ {
+		if wac.IsConnected() {
+			connected = true
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+	if !connected {
+		log.Fatal("❌ Timeout waiting for connection.")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
