@@ -1,228 +1,307 @@
+// session-web is a standalone, disposable website: it pairs a WhatsApp
+// number via whatsmeow, shows the resulting SHORT session string once in
+// the browser, and never writes it to disk, a database, or a log line.
+// Nothing here talks to Mongo, nothing here writes files — it's meant to
+// be deployed on its own (its own Heroku app / its own dyno) purely as a
+// "get my session string" tool.
 package main
 
 import (
 	"context"
+	"crypto/rand"
+	_ "embed"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
-	"os/signal"
+	"path/filepath"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
 
-	"PbxGb/client"
-	"PbxGb/config"
-	"PbxGb/database"
-	"PbxGb/modules"
-
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
-const sessionDB = "session.db"
+//go:embed index.html
+var indexHTML []byte
+
+// ── in-memory-only job tracking (never touches disk) ───────────────────
+
+type job struct {
+	mu         sync.Mutex
+	status     string // "waiting" -> "code" -> "done" | "error"
+	code       string
+	sessionOut string
+	errMsg     string
+	createdAt  time.Time
+}
+
+var (
+	jobsMu sync.Mutex
+	jobs   = map[string]*job{}
+)
+
+func newJobID() string {
+	b := make([]byte, 12)
+	_, _ = rand.Read(b)
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// janitor drops jobs nobody ever polled, so memory doesn't grow forever.
+func janitor() {
+	for {
+		time.Sleep(2 * time.Minute)
+		cutoff := time.Now().Add(-10 * time.Minute)
+		jobsMu.Lock()
+		for id, j := range jobs {
+			j.mu.Lock()
+			old := j.createdAt.Before(cutoff)
+			j.mu.Unlock()
+			if old {
+				delete(jobs, id)
+			}
+		}
+		jobsMu.Unlock()
+	}
+}
 
 func main() {
-	config.Load()
-
-	if config.C.Session != "" {
-		if err := restoreSession(config.C.Session); err != nil {
-			log.Fatalf("❌ Session restore failed: %v", err)
-		}
-		fmt.Println("✅ Session restored")
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8000"
 	}
 
-	if err := database.Connect(config.C.MongoURI); err != nil {
-		log.Fatalf("❌ MongoDB error: %v", err)
-	}
-	defer database.Disconnect()
+	go janitor()
 
-	// Load PM security settings into memory now that DB is connected.
-	modules.InitPMCache()
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(indexHTML)
+	})
+	http.HandleFunc("/pair", handlePair)
+	http.HandleFunc("/status", handleStatus)
+
+	log.Printf("session-web listening on :%s", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func handlePair(w http.ResponseWriter, r *http.Request) {
+	number := strings.TrimSpace(r.URL.Query().Get("number"))
+	number = strings.NewReplacer("+", "", " ", "", "-", "").Replace(number)
+	if number == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Enter a WhatsApp number."})
+		return
+	}
+
+	id := newJobID()
+	j := &job{status: "waiting", createdAt: time.Now()}
+	jobsMu.Lock()
+	jobs[id] = j
+	jobsMu.Unlock()
+
+	// A real (but temporary) SQLite file. Heroku's filesystem is ephemeral
+	// anyway, and we delete this file ourselves within seconds of pairing —
+	// it never gets backed up or persisted, it's just more reliable than
+	// SQLite's shared in-memory URI mode across driver versions.
+	dbPath := filepath.Join(os.TempDir(), "session-web-"+id+".db")
+	cleanupFile := func() {
+		_ = os.Remove(dbPath)
+		_ = os.Remove(dbPath + "-shm")
+		_ = os.Remove(dbPath + "-wal")
+	}
 
 	container, err := sqlstore.New(
 		context.Background(),
 		"sqlite3",
-		"file:"+sessionDB+"?_foreign_keys=on",
+		"file:"+dbPath+"?_foreign_keys=on",
 		nil,
 	)
 	if err != nil {
-		log.Fatalf("❌ SQLite error: %v", err)
+		log.Printf("[pair %s] sqlstore.New failed: %v", id, err)
+		cleanupFile()
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error (store): " + err.Error()})
+		return
 	}
 
-	deviceStore, err := container.GetFirstDevice(context.Background())
-	if err != nil {
-		log.Fatalf("❌ Device error: %v", err)
-	}
-
-	wac := whatsmeow.NewClient(deviceStore, nil)
-	client.Set(wac)
+	device := container.NewDevice()
+	wac := whatsmeow.NewClient(device, waLog.Noop)
 
 	wac.AddEventHandler(func(evt interface{}) {
-		switch v := evt.(type) {
-
-		case *events.Message:
-			// Cache every message for anti-delete
-			modules.CacheMessage(v)
-
-			// Anti Delete
-			modules.HandleAntiDelete(v)
-
-			// Anti View Once — save all view-once incoming
-			modules.HandleAntiViewOnce(v)
-
-			// Auto VV — automatically save view-once to saved messages
-			modules.HandleAutoVV(v)
-			modules.HandleEmojiVV(v)
-			modules.HandleAntiLink(v)
-
-			// Auto Save media to self chat
-			modules.HandleAutoSave(v)
-
-			// Auto React to DMs
-			modules.HandleAutoReact(v)
-
-			// AFK auto-reply
-			modules.HandleAFK(v)
-
-			// PM Security
-			modules.HandleGbanRejoin(v)
-			modules.HandlePM(v)
-
-			// Command handler (all .commands)
-			modules.HandleMessage(v)
-
-		case *events.CallOffer:
-			modules.HandleCall(v)
+		if _, ok := evt.(*events.Connected); !ok {
+			return
 		}
+		j.mu.Lock()
+		defer j.mu.Unlock()
+		if j.status == "done" {
+			return
+		}
+		sess, err := encodeShort(wac.Store)
+		if err != nil {
+			j.status = "error"
+			j.errMsg = "Paired, but could not read back the device identity: " + err.Error()
+			return
+		}
+		j.status = "done"
+		j.sessionOut = sess
+
+		// Nothing is persisted: disconnect and delete the temp file
+		// shortly after so no state lingers on disk either.
+		go func() {
+			time.Sleep(3 * time.Second)
+			wac.Disconnect()
+			_ = container.Close()
+			cleanupFile()
+		}()
 	})
-
-	if wac.Store.ID == nil {
-		if err := pairCodeLogin(wac); err != nil {
-			log.Fatalf("❌ Login failed: %v", err)
-		}
-	} else {
-		if err := wac.Connect(); err != nil {
-			log.Fatalf("❌ Connect error: %v", err)
-		}
-		fmt.Println("✅ PbxGb Connected")
-	}
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
-	<-quit
-
-	fmt.Println("")
-	fmt.Println("🔌 Disconnecting...")
-	wac.Disconnect()
-}
-
-func restoreSession(sessionStr string) error {
-	data, err := base64.StdEncoding.DecodeString(sessionStr)
-	if err != nil {
-		return fmt.Errorf("base64 decode: %w", err)
-	}
-	return os.WriteFile(sessionDB, data, 0600)
-}
-
-func saveSessionToEnv() error {
-	data, err := os.ReadFile(sessionDB)
-	if err != nil {
-		return err
-	}
-	session := strings.TrimSpace(base64.StdEncoding.EncodeToString(data))
-	envData, err := os.ReadFile(".env")
-	if err != nil {
-		return err
-	}
-	var newLines []string
-	for _, line := range strings.Split(string(envData), "\n") {
-		if !strings.HasPrefix(line, "SESSION=") {
-			newLines = append(newLines, line)
-		}
-	}
-	newLines = append(newLines, "SESSION="+session)
-	return os.WriteFile(".env", []byte(strings.Join(newLines, "\n")), 0644)
-}
-
-func pairCodeLogin(wac *whatsmeow.Client) error {
-	banner("PAIR CODE LOGIN")
 
 	if err := wac.Connect(); err != nil {
-		return err
+		log.Printf("[pair %s] Connect failed: %v", id, err)
+		_ = container.Close()
+		cleanupFile()
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Could not connect to WhatsApp, try again."})
+		return
 	}
-	time.Sleep(10 * time.Second)
 
-	var number string
-	fmt.Print("Enter WhatsApp Number (91xxxxxxxxxx): ")
-	fmt.Scanln(&number)
+	time.Sleep(8 * time.Second) // let the websocket handshake finish
 
-	number = strings.TrimSpace(number)
-	number = strings.ReplaceAll(number, "+", "")
-	number = strings.ReplaceAll(number, " ", "")
-
-	code, err := wac.PairPhone(
-		context.Background(),
-		number,
-		true,
-		whatsmeow.PairClientChrome,
-		"Chrome (Linux)",
-	)
+	code, err := wac.PairPhone(context.Background(), number, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 	if err != nil {
-		fmt.Println("⚠️ Retry after 5 seconds...")
-		time.Sleep(5 * time.Second)
-		code, err = wac.PairPhone(
-			context.Background(),
-			number,
-			true,
-			whatsmeow.PairClientChrome,
-			"Chrome (Linux)",
-		)
-		if err != nil {
-			return err
-		}
+		time.Sleep(3 * time.Second)
+		code, err = wac.PairPhone(context.Background(), number, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+	}
+	if err != nil {
+		log.Printf("[pair %s] PairPhone failed: %v", id, err)
+		wac.Disconnect()
+		_ = container.Close()
+		cleanupFile()
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Could not get a pair code — check the number and try again."})
+		return
 	}
 
-	banner("YOUR PAIR CODE")
-	fmt.Println(code)
-	fmt.Println("")
-	fmt.Println("WhatsApp > Linked Devices > Link with phone number")
-	fmt.Println("Enter the code above")
-	fmt.Println("Waiting for login...")
+	j.mu.Lock()
+	j.status = "code"
+	j.code = code
+	j.mu.Unlock()
 
-	loggedIn := make(chan struct{})
-	wac.AddEventHandler(func(evt interface{}) {
-		switch evt.(type) {
-		case *events.Connected:
-			select {
-			case <-loggedIn:
-			default:
-				close(loggedIn)
-			}
-		}
-	})
+	writeJSON(w, http.StatusOK, map[string]string{"id": id, "code": code})
+}
 
-	select {
-	case <-loggedIn:
-		fmt.Println("✅ Logged in successfully")
-		time.Sleep(5 * time.Second)
-		if err := saveSessionToEnv(); err != nil {
-			fmt.Println("❌ Failed to save SESSION in .env")
-		} else {
-			fmt.Println("✅ SESSION saved in .env")
-		}
-		return nil
-	case <-time.After(3 * time.Minute):
-		return fmt.Errorf("login timeout")
+func handleStatus(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+
+	jobsMu.Lock()
+	j, ok := jobs[id]
+	jobsMu.Unlock()
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+
+	j.mu.Lock()
+	status := j.status
+	sess := j.sessionOut
+	errMsg := j.errMsg
+	j.mu.Unlock()
+
+	resp := map[string]string{"status": status}
+	if status == "done" {
+		resp["session"] = sess
+	} else if status == "error" {
+		resp["error"] = errMsg
+	}
+	writeJSON(w, http.StatusOK, resp)
+
+	// One-time reveal: once the browser has picked up the final state,
+	// forget it server-side so the session string can't be re-fetched
+	// from this process again.
+	if status == "done" || status == "error" {
+		jobsMu.Lock()
+		delete(jobs, id)
+		jobsMu.Unlock()
 	}
 }
 
-func banner(title string) {
-	line := "==================================="
-	fmt.Println(line)
-	fmt.Printf(" %s\n", title)
-	fmt.Println(line)
+// ── short session encoding (same format as PbxGb/session.Encode) ──────
+//
+// Duplicated here on purpose: this tool is meant to be deployed
+// completely standalone from the bot repo, with no shared module.
+
+func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
+
+type shortSessionBlob struct {
+	ID             string `json:"id"`
+	LID            string `json:"lid,omitempty"`
+	RegistrationID uint32 `json:"reg"`
+
+	NoiseKeyPriv    string `json:"nk"`
+	IdentityKeyPriv string `json:"ik"`
+
+	SignedPreKeyPriv string `json:"spk"`
+	SignedPreKeyID   uint32 `json:"spkid"`
+	SignedPreKeySig  string `json:"spksig"`
+
+	AdvSecretKey string `json:"adv"`
+
+	AccountDetails string `json:"acd"`
+	AccountSigKey  string `json:"acsk"`
+	AccountSig     string `json:"acs"`
+	DeviceSig      string `json:"ds"`
+
+	Platform     string `json:"pl,omitempty"`
+	BusinessName string `json:"bn,omitempty"`
+	PushName     string `json:"pn,omitempty"`
+}
+
+func encodeShort(device *store.Device) (string, error) {
+	if device.ID == nil {
+		return "", fmt.Errorf("device is not logged in yet")
+	}
+	if device.Account == nil {
+		return "", fmt.Errorf("device has no account identity yet")
+	}
+
+	b := shortSessionBlob{
+		ID:             device.ID.String(),
+		RegistrationID: device.RegistrationID,
+
+		NoiseKeyPriv:    b64(device.NoiseKey.Priv[:]),
+		IdentityKeyPriv: b64(device.IdentityKey.Priv[:]),
+
+		SignedPreKeyPriv: b64(device.SignedPreKey.Priv[:]),
+		SignedPreKeyID:   device.SignedPreKey.KeyID,
+		SignedPreKeySig:  b64(device.SignedPreKey.Signature[:]),
+
+		AdvSecretKey: b64(device.AdvSecretKey),
+
+		AccountDetails: b64(device.Account.Details),
+		AccountSigKey:  b64(device.Account.AccountSignatureKey),
+		AccountSig:     b64(device.Account.AccountSignature),
+		DeviceSig:      b64(device.Account.DeviceSignature),
+
+		Platform:     device.Platform,
+		BusinessName: device.BusinessName,
+		PushName:     device.PushName,
+	}
+	if !device.LID.IsEmpty() {
+		b.LID = device.LID.String()
+	}
+
+	raw, err := json.Marshal(b)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(raw), nil
 }

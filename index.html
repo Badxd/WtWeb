@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PbxGb — Session Generator</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --card: #171a21;
+    --accent: #25d366;
+    --text: #e8eaed;
+    --muted: #8a8f98;
+    --border: #2a2e37;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 16px;
+  }
+  .card {
+    width: 100%;
+    max-width: 440px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 28px;
+  }
+  h1 {
+    font-size: 20px;
+    text-align: center;
+    margin-bottom: 6px;
+  }
+  p.sub {
+    color: var(--muted);
+    text-align: center;
+    font-size: 13px;
+    margin-bottom: 24px;
+  }
+  label {
+    font-size: 13px;
+    color: var(--muted);
+    display: block;
+    margin-bottom: 6px;
+  }
+  input[type=text] {
+    width: 100%;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: #0f1115;
+    color: var(--text);
+    font-size: 15px;
+    outline: none;
+  }
+  input[type=text]:focus { border-color: var(--accent); }
+  button {
+    width: 100%;
+    margin-top: 16px;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: none;
+    background: var(--accent);
+    color: #06210f;
+    font-weight: 600;
+    font-size: 15px;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .box {
+    margin-top: 20px;
+    padding: 14px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: #0f1115;
+    display: none;
+  }
+  .box.show { display: block; }
+  .code {
+    font-size: 24px;
+    letter-spacing: 2px;
+    text-align: center;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .box-label { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  textarea {
+    width: 100%;
+    min-height: 90px;
+    resize: vertical;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: #0b0d11;
+    color: var(--text);
+    font-family: monospace;
+    font-size: 12px;
+    padding: 10px;
+  }
+  .row { display: flex; gap: 8px; margin-top: 10px; }
+  .row button { margin-top: 0; }
+  .warn {
+    margin-top: 14px;
+    font-size: 12px;
+    color: #ffb454;
+    line-height: 1.5;
+  }
+  .status { text-align: center; font-size: 13px; color: var(--muted); margin-top: 12px; }
+  .error { color: #ff6b6b; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>WhatsApp Session Generator</h1>
+    <p class="sub">Pairs your number, shows a short session string. Nothing is saved on this server.</p>
+
+    <label for="number">WhatsApp number (with country code, no + or spaces)</label>
+    <input type="text" id="number" placeholder="919646191598" autocomplete="off" />
+    <button id="getCodeBtn">Get Pair Code</button>
+
+    <div class="box" id="codeBox">
+      <div class="box-label">Enter this on WhatsApp → Linked Devices → Link with phone number</div>
+      <div class="code" id="codeText"></div>
+    </div>
+
+    <div class="status" id="statusText"></div>
+
+    <div class="box" id="sessionBox">
+      <div class="box-label">Your session string — copy it now, it will not be shown again</div>
+      <textarea id="sessionText" readonly></textarea>
+      <div class="row">
+        <button id="copyBtn">Copy</button>
+      </div>
+      <div class="warn">
+        This string is not stored anywhere on this server or in any database.
+        Paste it into your bot's <code>SESSION</code> config var. If you lose it,
+        just generate a new one here — pairing again replaces the old device link.
+      </div>
+    </div>
+  </div>
+
+<script>
+const getCodeBtn = document.getElementById('getCodeBtn');
+const numberInput = document.getElementById('number');
+const codeBox = document.getElementById('codeBox');
+const codeText = document.getElementById('codeText');
+const statusText = document.getElementById('statusText');
+const sessionBox = document.getElementById('sessionBox');
+const sessionText = document.getElementById('sessionText');
+const copyBtn = document.getElementById('copyBtn');
+
+let pollTimer = null;
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+getCodeBtn.addEventListener('click', async () => {
+  const number = numberInput.value.trim().replace(/[^0-9]/g, '');
+  if (!number) { statusText.textContent = 'Enter a valid number.'; return; }
+
+  stopPolling();
+  sessionBox.classList.remove('show');
+  codeBox.classList.remove('show');
+  statusText.textContent = '';
+  statusText.classList.remove('error');
+  getCodeBtn.disabled = true;
+  getCodeBtn.textContent = 'Requesting code...';
+
+  try {
+    const res = await fetch('/pair?number=' + encodeURIComponent(number));
+    const data = await res.json();
+    if (data.error) {
+      statusText.textContent = data.error;
+      statusText.classList.add('error');
+      getCodeBtn.disabled = false;
+      getCodeBtn.textContent = 'Get Pair Code';
+      return;
+    }
+    codeText.textContent = data.code;
+    codeBox.classList.add('show');
+    statusText.textContent = 'Waiting for you to link the device...';
+    getCodeBtn.textContent = 'Get Pair Code';
+    getCodeBtn.disabled = false;
+
+    pollTimer = setInterval(async () => {
+      try {
+        const s = await fetch('/status?id=' + encodeURIComponent(data.id));
+        const sd = await s.json();
+        if (sd.status === 'done') {
+          stopPolling();
+          codeBox.classList.remove('show');
+          sessionText.value = sd.session;
+          sessionBox.classList.add('show');
+          statusText.textContent = 'Linked! Copy your session below.';
+        } else if (sd.status === 'error') {
+          stopPolling();
+          statusText.textContent = sd.error || 'Something went wrong.';
+          statusText.classList.add('error');
+        } else if (s.status === 404 || sd.error === 'not found') {
+          stopPolling();
+        }
+      } catch (e) { /* keep polling */ }
+    }, 2000);
+
+  } catch (e) {
+    statusText.textContent = 'Request failed. Try again.';
+    statusText.classList.add('error');
+    getCodeBtn.disabled = false;
+    getCodeBtn.textContent = 'Get Pair Code';
+  }
+});
+
+copyBtn.addEventListener('click', () => {
+  sessionText.select();
+  document.execCommand('copy');
+  copyBtn.textContent = 'Copied!';
+  setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+});
+</script>
+</body>
+</html>
