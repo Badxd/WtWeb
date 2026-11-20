@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -142,12 +141,10 @@ func main() {
 	wac := whatsmeow.NewClient(device, waLog.Noop)
 
 	sessionCh := make(chan string)
-	var pairSuccess bool
 
 	wac.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.PairSuccess:
-			pairSuccess = true
 			log.Println("✅ Pair Success! Logging in...")
 			// Give it 2 seconds to sync keys before extracting session
 			time.Sleep(2 * time.Second)
