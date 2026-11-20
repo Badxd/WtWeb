@@ -97,7 +97,6 @@ func encodeShort(device *store.Device) (string, error) {
 // ── Main Logic ─────────────────────────────────────────────────────────
 
 func main() {
-	// 1. Ask for Number
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Print("📱 Enter WhatsApp Number (e.g. 919465031516): ")
 	numberRaw, _ := reader.ReadString('\n')
@@ -107,7 +106,6 @@ func main() {
 		log.Fatal("❌ Number cannot be empty.")
 	}
 
-	// 2. Setup temporary SQLite DB
 	dbPath := filepath.Join(os.TempDir(), "session-cli-temp.db")
 	defer func() {
 		os.Remove(dbPath)
@@ -126,18 +124,19 @@ func main() {
 	}
 
 	device := container.NewDevice()
-	wac := whatsmeow.NewClient(device, waLog.Noop)
+	// CHANGED: Logger ON kitta hai taaki error dikhe
+	wac := whatsmeow.NewClient(device, waLog.Stdout("WhatsApp", "DEBUG", true))
 
-	// 3. Channels to track state
 	connectedCh := make(chan struct{})
 	sessionCh := make(chan string)
 	var connectedOnce sync.Once
 	var pairSuccess bool
 
 	wac.AddEventHandler(func(evt interface{}) {
-		switch evt.(type) {
+		switch v := evt.(type) {
 		case *events.Disconnected:
-			log.Println("⚠️ WhatsApp websocket disconnected")
+			// CHANGED: Disconnect da error print karega
+			log.Printf("⚠️ WhatsApp websocket disconnected: %v", v)
 
 		case *events.Connected:
 			log.Println("✅ Connected to WhatsApp")
@@ -148,39 +147,34 @@ func main() {
 			log.Println("✅ Pair Success! Logging in...")
 
 		case *events.PairError:
-			log.Println("❌ Pair Error. Code may be invalid or expired.")
+			log.Printf("❌ Pair Error: %v", v)
 
 		default:
-			// If we are paired and have an ID, we can extract the session
 			if pairSuccess && wac.Store.ID != nil {
 				sess, err := encodeShort(wac.Store)
 				if err == nil && sess != "" {
 					select {
 					case sessionCh <- sess:
-						// Sent to main thread
 					default:
-						// Avoid blocking
 					}
 				}
 			}
 		}
 	})
 
-	// 4. Connect
 	log.Println("🔌 Connecting to WhatsApp...")
 	if err := wac.Connect(); err != nil {
 		log.Fatalf("❌ Could not connect: %v", err)
 	}
 
-	// Wait for connection (max 30s)
+	// CHANGED: Timeout 60 second kitta hai taaki pata lage connection kyu fail ho reha
 	select {
 	case <-connectedCh:
 		// Ready
-	case <-time.After(30 * time.Second):
-		log.Fatal("❌ Timeout waiting for connection.")
+	case <-time.After(60 * time.Second):
+		log.Fatal("❌ Timeout waiting for connection. Network block ya WhatsApp block ho sakda hai.")
 	}
 
-	// 5. Request Pair Code
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -198,7 +192,6 @@ func main() {
 	fmt.Println("👉 3. Enter the code above.")
 	fmt.Println("⏳ Waiting for you to enter the code (max 2 minutes)...\n")
 
-	// 6. Wait for Session
 	select {
 	case session := <-sessionCh:
 		fmt.Println("\n==============================================")
@@ -210,6 +203,5 @@ func main() {
 		log.Fatal("❌ Timeout: You did not enter the code on your phone in time.")
 	}
 
-	// Cleanup
 	wac.Disconnect()
 }
