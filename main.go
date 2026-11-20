@@ -10,12 +10,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -24,6 +26,21 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 )
+
+// ── Force IPv4 to fix Termux VPN IPv6 hangs ───────────────────────────
+
+func init() {
+	// Force websocket to use IPv4 only
+	websocket.DefaultDialer.NetDial = func(network, addr string) (net.Conn, error) {
+		return net.DialTimeout("tcp4", addr, 10*time.Second)
+	}
+	// Force Go's DNS resolver to use IPv4 only
+	net.DefaultResolver.PreferGo = true
+	net.DefaultResolver.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		d := net.Dialer{Timeout: 10 * time.Second}
+		return d.DialContext(ctx, "udp4", address)
+	}
+}
 
 // ── short session encoding ─────────────────────────────────────────────
 
@@ -124,7 +141,7 @@ func main() {
 	}
 
 	device := container.NewDevice()
-	// CHANGED: Logger ON kitta hai taaki error dikhe
+	// Logger ON kitta hai taaki error dikhe
 	wac := whatsmeow.NewClient(device, waLog.Stdout("WhatsApp", "DEBUG", true))
 
 	connectedCh := make(chan struct{})
@@ -135,7 +152,6 @@ func main() {
 	wac.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Disconnected:
-			// CHANGED: Disconnect da error print karega
 			log.Printf("⚠️ WhatsApp websocket disconnected: %v", v)
 
 		case *events.Connected:
@@ -167,7 +183,6 @@ func main() {
 		log.Fatalf("❌ Could not connect: %v", err)
 	}
 
-	// CHANGED: Timeout 60 second kitta hai taaki pata lage connection kyu fail ho reha
 	select {
 	case <-connectedCh:
 		// Ready
