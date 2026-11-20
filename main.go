@@ -6,7 +6,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -26,7 +25,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// ── short session encoding (same format as PbxGb/session.Encode) ──────
+// ── short session encoding ─────────────────────────────────────────────
 
 func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
 
