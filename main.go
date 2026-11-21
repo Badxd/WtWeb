@@ -30,7 +30,6 @@ import (
 var indexHTML []byte
 
 // ── Force IPv4 to fix Termux VPN IPv6 hangs ───────────────────────────
-
 func init() {
 	websocket.DefaultDialer.NetDial = func(network, addr string) (net.Conn, error) {
 		return net.DialTimeout("tcp4", addr, 10*time.Second)
@@ -43,7 +42,6 @@ func init() {
 }
 
 // ── Job Tracking ──────────────────────────────────────────────────────
-
 type job struct {
 	mu         sync.Mutex
 	status     string
@@ -82,6 +80,9 @@ func janitor() {
 }
 
 func main() {
+	// 🔥 EH LINE SAB TON ZAROORI HAI - WHATSAPP VERSION FORCE KARAN LYI
+	store.SetWAVersion([3]uint32{2, 2413, 1}) 
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8000"
@@ -167,11 +168,8 @@ func runPairingJob(id string, number string, j *job) {
 	}
 
 	device := container.NewDevice()
-	
-	// LOGGER ON kitta hai taaki pata lage WhatsApp kyu disconnect kar reha hai
 	wac := whatsmeow.NewClient(device, waLog.Stdout("WA", "DEBUG", true))
 
-	// Event handlers
 	wac.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.PairSuccess:
@@ -199,7 +197,6 @@ func runPairingJob(id string, number string, j *job) {
 		}
 	})
 
-	// Retry loop for connection and PairPhone
 	var code string
 	var pairErr error
 
@@ -212,7 +209,6 @@ func runPairingJob(id string, number string, j *job) {
 			continue
 		}
 
-		// Wait for connection to fully establish
 		connected := false
 		for i := 0; i < 30; i++ {
 			if wac.IsConnected() {
@@ -229,7 +225,6 @@ func runPairingJob(id string, number string, j *job) {
 			continue
 		}
 
-		// Wait 2 seconds after connection before requesting PairPhone
 		time.Sleep(2 * time.Second)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -237,18 +232,18 @@ func runPairingJob(id string, number string, j *job) {
 		cancel()
 
 		if pairErr == nil {
-			break // Success!
+			break 
 		}
 
 		log.Printf("[pair %s] Attempt %d failed: %v", id, attempt, pairErr)
 		wac.Disconnect()
-		time.Sleep(5 * time.Second) // Wait before retrying
+		time.Sleep(5 * time.Second) 
 	}
 
 	if pairErr != nil {
 		j.mu.Lock()
 		j.status = "error"
-		j.errMsg = "PairPhone failed: " + pairErr.Error() + ". WhatsApp may be blocking your IP. Try VPN or wait 1 hour."
+		j.errMsg = "PairPhone failed: " + pairErr.Error()
 		j.mu.Unlock()
 		wac.Disconnect()
 		_ = container.Close()
@@ -297,7 +292,6 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── Session Encoding ──────────────────────────────────────────────────
-
 func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
 
 type shortSessionBlob struct {
