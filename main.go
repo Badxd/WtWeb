@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
