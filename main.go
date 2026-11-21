@@ -80,9 +80,6 @@ func janitor() {
 }
 
 func main() {
-	// 🔥 EH LINE SAB TON ZAROORI HAI - WHATSAPP VERSION FORCE KARAN LYI
-	store.SetWAVersion([3]uint32{2, 2413, 1}) 
-
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8000"
