@@ -46,7 +46,7 @@ func init() {
 
 type job struct {
 	mu         sync.Mutex
-	status     string // "waiting" -> "code" -> "done" | "error"
+	status     string
 	code       string
 	sessionOut string
 	errMsg     string
@@ -80,8 +80,6 @@ func janitor() {
 		jobsMu.Unlock()
 	}
 }
-
-// ── HTTP Handlers ─────────────────────────────────────────────────────
 
 func main() {
 	port := os.Getenv("PORT")
@@ -124,8 +122,7 @@ func handlePair(w http.ResponseWriter, r *http.Request) {
 
 	go runPairingJob(id, number, j)
 
-	// Wait max 25 seconds for pair code
-	for i := 0; i < 25; i++ {
+	for i := 0; i < 40; i++ {
 		time.Sleep(1 * time.Second)
 		j.mu.Lock()
 		status := j.status
@@ -170,12 +167,15 @@ func runPairingJob(id string, number string, j *job) {
 	}
 
 	device := container.NewDevice()
-	wac := whatsmeow.NewClient(device, waLog.Noop)
+	
+	// LOGGER ON kitta hai taaki pata lage WhatsApp kyu disconnect kar reha hai
+	wac := whatsmeow.NewClient(device, waLog.Stdout("WA", "DEBUG", true))
 
+	// Event handlers
 	wac.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.PairSuccess:
-			time.Sleep(2 * time.Second) // Sync keys
+			time.Sleep(2 * time.Second)
 			if wac.Store.ID != nil {
 				sess, err := encodeShort(wac.Store)
 				j.mu.Lock()
@@ -199,45 +199,56 @@ func runPairingJob(id string, number string, j *job) {
 		}
 	})
 
-	if err := wac.Connect(); err != nil {
-		j.mu.Lock()
-		j.status = "error"
-		j.errMsg = "Connect error: " + err.Error()
-		j.mu.Unlock()
-		_ = container.Close()
-		cleanupFile()
-		return
-	}
+	// Retry loop for connection and PairPhone
+	var code string
+	var pairErr error
 
-	// Wait for connection
-	connected := false
-	for i := 0; i < 30; i++ {
-		if wac.IsConnected() {
-			connected = true
-			break
+	for attempt := 1; attempt <= 3; attempt++ {
+		log.Printf("[pair %s] Connection Attempt %d...", id, attempt)
+		
+		if err := wac.Connect(); err != nil {
+			pairErr = err
+			time.Sleep(3 * time.Second)
+			continue
 		}
-		time.Sleep(1 * time.Second)
-	}
-	if !connected {
-		j.mu.Lock()
-		j.status = "error"
-		j.errMsg = "Timeout connecting to WhatsApp."
-		j.mu.Unlock()
+
+		// Wait for connection to fully establish
+		connected := false
+		for i := 0; i < 30; i++ {
+			if wac.IsConnected() {
+				connected = true
+				break
+			}
+			time.Sleep(1 * time.Second)
+		}
+		
+		if !connected {
+			pairErr = fmt.Errorf("timeout connecting to WhatsApp")
+			wac.Disconnect()
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		// Wait 2 seconds after connection before requesting PairPhone
+		time.Sleep(2 * time.Second)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		code, pairErr = wac.PairPhone(ctx, number, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+		cancel()
+
+		if pairErr == nil {
+			break // Success!
+		}
+
+		log.Printf("[pair %s] Attempt %d failed: %v", id, attempt, pairErr)
 		wac.Disconnect()
-		_ = container.Close()
-		cleanupFile()
-		return
+		time.Sleep(5 * time.Second) // Wait before retrying
 	}
 
-	// Use context.Background() so HTTP timeout doesn't cancel pairing
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	code, err := wac.PairPhone(ctx, number, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
-	if err != nil {
+	if pairErr != nil {
 		j.mu.Lock()
 		j.status = "error"
-		j.errMsg = "PairPhone failed: " + err.Error()
+		j.errMsg = "PairPhone failed: " + pairErr.Error() + ". WhatsApp may be blocking your IP. Try VPN or wait 1 hour."
 		j.mu.Unlock()
 		wac.Disconnect()
 		_ = container.Close()
